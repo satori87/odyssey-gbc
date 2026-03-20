@@ -8,14 +8,14 @@
 #define NUM_BG_PALETTES 4
 
 // 16x16 metatile sub-tile indices [row][col]
-#define WALL_TL  0
-#define WALL_TR  1
-#define WALL_BL  20
-#define WALL_BR  21
-#define FLOOR_TL 2
-#define FLOOR_TR 3
-#define FLOOR_BL 22
-#define FLOOR_BR 23
+#define WALL_TL  44
+#define WALL_TR  45
+#define WALL_BL  64
+#define WALL_BR  65
+#define FLOOR_TL 50
+#define FLOOR_TR 51
+#define FLOOR_BL 70
+#define FLOOR_BR 71
 #define TILE_CEILING 255
 
 const uint16_t bg_palettes[16] = {

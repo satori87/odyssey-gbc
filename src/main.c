@@ -8,6 +8,7 @@
 
 #include "../include/bg_tiles.h"
 #include "../include/lut.h"
+#include "../include/sprites_data.h"
 
 // CGB DMA registers
 #define HDMA1 (*(volatile uint8_t *)0xFF51)
@@ -106,6 +107,38 @@ void read_wall_2x(uint8_t texY, uint8_t texX, uint8_t *lo, uint8_t *hi) {
     *hi = (b0 ? 0xF0 : 0x00) | (b1 ? 0x0F : 0x00);
 }
 
+// Same as read_wall_2x but for floor metatile
+void read_floor_2x(uint8_t texY, uint8_t texX, uint8_t *lo, uint8_t *hi) {
+    uint8_t local_y = texY & 7;
+    uint16_t tile_L, tile_R;
+
+    if (texY < 8) { tile_L = FLOOR_TL; tile_R = FLOOR_TR; }
+    else          { tile_L = FLOOR_BL; tile_R = FLOOR_BR; }
+
+    uint16_t off_L = tile_L * 16 + local_y * 2;
+    uint16_t off_R = tile_R * 16 + local_y * 2;
+    uint8_t lo_L = bg_tile_data[off_L];
+    uint8_t hi_L = bg_tile_data[off_L + 1];
+    uint8_t lo_R = bg_tile_data[off_R];
+    uint8_t hi_R = bg_tile_data[off_R + 1];
+
+    uint8_t raw_lo, raw_hi;
+    if (texX == 0)       { raw_lo = lo_L; raw_hi = hi_L; }
+    else if (texX == 8)  { raw_lo = lo_R; raw_hi = hi_R; }
+    else if (texX < 8)   { raw_lo = (lo_L << texX) | (lo_R >> (8-texX));
+                           raw_hi = (hi_L << texX) | (hi_R >> (8-texX)); }
+    else                 { uint8_t s = texX-8;
+                           raw_lo = (lo_R << s) | (lo_L >> (8-s));
+                           raw_hi = (hi_R << s) | (hi_L >> (8-s)); }
+
+    uint8_t b0 = (raw_lo >> 7) & 1;
+    uint8_t b1 = (raw_lo >> 6) & 1;
+    *lo = (b0 ? 0xF0 : 0x00) | (b1 ? 0x0F : 0x00);
+    b0 = (raw_hi >> 7) & 1;
+    b1 = (raw_hi >> 6) & 1;
+    *hi = (b0 ? 0xF0 : 0x00) | (b1 ? 0x0F : 0x00);
+}
+
 // ================================================================
 // RAYCASTER + RENDERER
 // ================================================================
@@ -192,9 +225,17 @@ void raycast_and_render(void) {
                 continue;
             }
             if (by >= drawEnd) {
+                // Floor gradient: dark near horizon, light near bottom (3D depth)
                 uint8_t *p = &fb[toff];
                 uint8_t j;
-                for (j = 0; j < 8; j++) { p[j*2]=0xFF; p[j*2+1]=0x00; }
+                for (j = 0; j < 8; j++) {
+                    uint8_t sy = by + j;
+                    uint8_t dist = sy - (VIEW_H >> 1); // distance from horizon
+                    // color 3 (darkest) near horizon, 2 mid, 1 near bottom
+                    if (dist < 8)       { p[j*2]=0xFF; p[j*2+1]=0xFF; } // color 3
+                    else if (dist < 20) { p[j*2]=0x00; p[j*2+1]=0xFF; } // color 2
+                    else                { p[j*2]=0xFF; p[j*2+1]=0x00; } // color 1
+                }
                 continue;
             }
 
@@ -216,7 +257,11 @@ void raycast_and_render(void) {
                         lo = nlo; hi = nhi;
                     }
                 } else {
-                    lo = 0xFF; hi = 0x00;
+                    // Floor gradient in mixed tiles
+                    uint8_t dist = sy - (VIEW_H >> 1);
+                    if (dist < 8)       { lo=0xFF; hi=0xFF; }
+                    else if (dist < 20) { lo=0x00; hi=0xFF; }
+                    else                { lo=0xFF; hi=0x00; }
                 }
 
                 fb[toff + pr*2]   = lo;
@@ -247,9 +292,103 @@ void handle_input(void) {
     }
 }
 
+// ================================================================
+// OBJECTS — world items scattered across the map
+// ================================================================
+#define MAX_OBJECTS 8
+
+typedef struct {
+    int16_t x, y;   // 8.8 world position
+    uint8_t type;   // sprite type (0-3)
+    uint8_t active;
+} Object;
+
+Object objects[MAX_OBJECTS] = {
+    { (4 << 8)|0x80, (4 << 8)|0x80, 0, 1 },   // type 0 in corridor
+    { (8 << 8)|0x80, (4 << 8)|0x80, 1, 1 },   // type 1
+    { (12<< 8)|0x80, (4 << 8)|0x80, 2, 1 },   // type 2
+    { (5 << 8)|0x80, (7 << 8)|0x80, 3, 1 },   // type 3 in south room
+    { (10<< 8)|0x80, (7 << 8)|0x80, 0, 1 },
+    { (3 << 8)|0x80, (11<< 8)|0x80, 1, 1 },
+    { (8 << 8)|0x80, (11<< 8)|0x80, 2, 1 },
+    { (12<< 8)|0x80, (13<< 8)|0x80, 3, 1 },
+};
+
+// Project and render objects as hardware sprites
+void update_sprites(void) {
+    uint8_t i;
+    int8_t cos_pa = cos_table[pa];
+    int8_t sin_pa = sin_table[pa];
+    uint8_t oam_idx = 0;
+
+    // Hide all sprites first
+    for (i = 0; i < 40; i++) {
+        move_sprite(i, 0, 0);
+    }
+
+    for (i = 0; i < MAX_OBJECTS && oam_idx < 36; i++) {
+        if (!objects[i].active) continue;
+
+        // Relative position to player
+        int16_t dx = objects[i].x - px;
+        int16_t dy = objects[i].y - py;
+
+        // Transform to camera space (rotate by -player_angle)
+        // camZ = forward depth, camX = sideways
+        int16_t camZ = ((int32_t)dx * cos_pa + (int32_t)dy * sin_pa) >> 6;
+        int16_t camX = ((int32_t)-dx * sin_pa + (int32_t)dy * cos_pa) >> 6;
+
+        // Behind camera or too far? Skip
+        if (camZ < 64 || camZ > 3072) continue;
+
+        // Project to screen
+        int16_t proj = (int16_t)(((int32_t)camX * 480) / camZ);
+        int16_t scrX = 80 + proj;
+
+        // Anchor sprite to floor: use wall height at this distance
+        uint8_t dist_qt = (uint8_t)(camZ >> 6);
+        if (dist_qt < 1) dist_qt = 1;
+        if (dist_qt > 80) dist_qt = 80;
+        uint8_t wh = wall_height_px[dist_qt];
+        int16_t floorY = (VIEW_H >> 1) + (wh >> 1);
+        int16_t scrY = floorY - 16;  // sprite bottom sits on floor
+
+        // Clamp/skip if off screen
+        if (scrX < -8 || scrX > 168 || scrY < -8 || scrY > VIEW_H) continue;
+
+        // Scale: 16x16 at close range, shrink idea — but HW sprites are fixed size
+        // Just place the 4 OAM entries (2x2 of 8x8 tiles)
+        uint8_t base_tile = SPRITE_TILE_START + objects[i].type * 4;
+        uint8_t sx = (uint8_t)(scrX + 8);   // OAM X is offset by 8
+        uint8_t sy = (uint8_t)(scrY + 16);  // OAM Y is offset by 16
+
+        move_sprite(oam_idx,     sx,     sy);
+        set_sprite_tile(oam_idx, base_tile);
+        oam_idx++;
+
+        move_sprite(oam_idx,     sx + 8, sy);
+        set_sprite_tile(oam_idx, base_tile + 1);
+        oam_idx++;
+
+        move_sprite(oam_idx,     sx,     sy + 8);
+        set_sprite_tile(oam_idx, base_tile + 2);
+        oam_idx++;
+
+        move_sprite(oam_idx,     sx + 8, sy + 8);
+        set_sprite_tile(oam_idx, base_tile + 3);
+        oam_idx++;
+    }
+}
+
 void init(void) {
     if (_cpu == CGB_TYPE) cpu_fast();
     set_bkg_palette(0, 1, bg_palettes);
+
+    // Load sprite tiles into OBJ VRAM at tile 200+
+    set_sprite_data(SPRITE_TILE_START, NUM_SPRITE_TYPES * 4, sprite_tile_data);
+    // Set OBJ palette 0 (same colors as BG)
+    set_sprite_palette(0, 1, sprite_palette);
+
     {
         uint8_t row[SCR_W]; uint8_t ty, tx;
         for (ty = 0; ty < VIEW_ROWS; ty++) {
@@ -261,11 +400,9 @@ void init(void) {
             set_bkg_tiles(0, ty, SCR_W, 1, row);
     }
     { uint8_t ft[16]; uint8_t i;
-      for (i=0;i<8;i++){ft[i*2]=0xFF;ft[i*2+1]=0x00;}
+      for (i = 0; i < 8; i++) { ft[i*2]=0xFF; ft[i*2+1]=0x00; }
       set_bkg_data(240, 1, ft); }
     memset(fb, 0xFF, sizeof(fb));
-
-    // Transfer initial framebuffer to VRAM BEFORE enabling display
     set_bkg_data(0, 100, fb);
     set_bkg_data(100, 100, fb + 1600u);
 
@@ -273,9 +410,9 @@ void init(void) {
     py = (4 << 8) | 0x80;
     pa = 0;
     move_bkg(0, 0);
-    // Set LCDC flags BEFORE enabling LCD (BGB is strict about ordering)
-    // 0x91 = LCD on + BG on + $8000 tile addressing
-    LCDC_REG = LCDCF_ON | LCDCF_BGON | LCDCF_BG8000;
+    SPRITES_8x8;
+    SHOW_SPRITES;
+    LCDC_REG = LCDCF_ON | LCDCF_BGON | LCDCF_BG8000 | LCDCF_OBJON | LCDCF_OBJ8;
 }
 
 void main(void) {
@@ -283,6 +420,7 @@ void main(void) {
     while (1) {
         handle_input();
         raycast_and_render();
+        update_sprites();
         wait_vbl_done();
         set_bkg_data(0, 100, fb);
         set_bkg_data(100, 100, fb + 1600u);
