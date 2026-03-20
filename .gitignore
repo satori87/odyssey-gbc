@@ -1,0 +1,13 @@
+build/
+*.exe
+*.ini
+*.cdb
+*.o
+*.asm
+*.rel
+*.lst
+*.sym
+*.noi
+*.map
+*.ihx
+*.adb
